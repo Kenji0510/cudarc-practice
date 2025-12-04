@@ -1,81 +1,144 @@
-use cudarc::{driver::{CudaContext, DriverError, LaunchConfig, PushKernelArg}, nvrtc::Ptx};
+use cudarc::{driver::{CudaContext, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits}, nvrtc::Ptx};
 use anyhow::Result;
+use cudarc_practice::file_handler::load_pcd_xyzt;
+use core::f32;
 use std::time::Instant;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct Point3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+unsafe impl DeviceRepr for Point3 {}
+unsafe impl ValidAsZeroBits for Point3 {}
+
 fn main() -> Result<()> {
+    let pcd_path = "data/input/frame_100.pcd";
+    let points = match load_pcd_xyzt(pcd_path) {
+        Ok(p) => p,
+        Err(e) => {
+            // eprintln!("Error loading PCD file: {}", e);
+            return Err(e);
+        }
+    };
+
+    let points_vec: Vec<Point3> = points.iter().map(|p| {
+        Point3 {
+            x: p.x,
+            y: p.y,
+            z: p.z
+        }
+    }).collect();
+
+    let mut min_bound = Point3 { x: f32::MAX, y: f32::MAX, z: f32::MAX };
+    let mut max_bound = Point3 { x: f32::MIN, y: f32::MIN, z: f32::MIN };
+
+    for p in &points_vec {
+        min_bound.x = min_bound.x.min(p.x);
+        min_bound.y = min_bound.y.min(p.y);
+        min_bound.z = min_bound.z.min(p.z);
+        max_bound.x = max_bound.x.max(p.x);
+        max_bound.y = max_bound.y.max(p.y);
+        max_bound.z = max_bound.z.max(p.z);
+    }
+
+    let range_x = max_bound.x - min_bound.x;
+    let range_y = max_bound.y - min_bound.y;
+    let range_z = max_bound.z - min_bound.z;
+    let max_range = range_x.max(range_y).max(range_z);
+    let scale = 2097152.0 / max_range; // 2^21 - 1
+
+    println!("Point cloud stats:");
+    println!("  Number of points: {}", points_vec.len());
+    println!("  Min bound: ({:.3}, {:.3}, {:.3})", min_bound.x, min_bound.y, min_bound.z);
+    println!("  Max bound: ({:.3}, {:.3}, {:.3})", max_bound.x, max_bound.y, max_bound.z);
+    println!("  Scale: {:.3}", scale);
+
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
 
-    let module = ctx.load_module(Ptx::from_file("src/kernel/constant_memory.ptx"))?;
+    let points_dev = stream.clone_htod(&points_vec)?;
 
-    let mut coefficients_symbol = module.get_global("coefficients", &stream)?;
-    
-    let coefficients = [1.0f32, 2.0, 3.0, 4.0];
+    let num_points = points.len();
+    let mut codes_dev = stream.alloc_zeros::<u64>(num_points)?;
+    let mut indices_dev = stream.alloc_zeros::<i32>(num_points)?;
 
-    let mut symbol_view = coefficients_symbol.as_view_mut();
-    let mut symbol_f32 = unsafe {
-        symbol_view.transmute_mut::<f32>(4).unwrap()
-    };
-    stream.memcpy_htod(&coefficients, &mut symbol_f32)?;
+    // Load the kernel
+    let module = ctx.load_module(Ptx::from_file("src/kernel/morton3d.ptx"))?;
+    let morton_kernel = module.load_function("compute_morton_codes")?;
 
-    let polynoimal_kernel = module.load_function("polynomial_kernel")?;
+    let cfg = LaunchConfig::for_num_elems(num_points as u32);
 
-    // let input = vec![0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0];
-    let input: Vec<f32> = (0..16384).map(|i| i as f32).collect();
-    let n = input.len();
+    let start_morton = Instant::now();
 
-    let input_dev = stream.clone_htod(&input)?;
-    let mut output_dev = stream.alloc_zeros::<f32>(n)?;
-
-    let cfg = LaunchConfig::for_num_elems(n as u32);
-
-    // --- ベンチマーク設定 ---
-    let iterations = 50000; // ループ回数
-
-    // 1. ウォームアップ（最初の1回は初期化コストがかかることがあるため、計測に含めない）
     unsafe {
-        stream.launch_builder(&polynoimal_kernel)
-            .arg(&mut output_dev)
-            .arg(&input_dev)
-            .arg(&(n as i32))
+        stream.launch_builder(&morton_kernel)
+            .arg(&points_dev)
+            .arg(&mut codes_dev)
+            .arg(&mut indices_dev)
+            .arg(&(num_points as i32))
+            .arg(&min_bound)
+            .arg(&scale)
             .launch(cfg)?;
     }
-    stream.synchronize()?; // ウォームアップ完了を待つ
 
-    println!("Start benchmarking for {} iterations...", iterations);
-
-    // 2. 計測開始
-    let start = Instant::now();
-
-    for _ in 0..iterations {
-        unsafe {
-            // launch_builderは再利用可能です
-            stream.launch_builder(&polynoimal_kernel)
-                .arg(&mut output_dev) // 同じメモリ領域を使い回す
-                .arg(&input_dev)
-                .arg(&(n as i32))
-                .launch(cfg)?;
-        }
-        // ここで synchronize() を呼ぶと「毎回」CPUとGPUが同期して遅くなるため、
-        // スループットを見たい場合はループの外で最後に1回待つのが一般的です。
-    }
-
-    // 3. 全てのキューが処理されるのを待つ (重要！)
     stream.synchronize()?;
 
-    // 4. 計測終了
-    let duration = start.elapsed();
+    let duration = start_morton.elapsed();
+    println!("Morton3D kernel execution time: {:.3} ms", duration.as_secs_f64() * 1000.0);
     
-    // 結果表示
-    let total_time_ms = duration.as_millis();
-    let avg_time_us = duration.as_micros() as f64 / iterations as f64;
+    let morton_codes = stream.clone_dtoh(&codes_dev)?;
+    let indices = stream.clone_dtoh(&indices_dev)?;
 
-    println!("Total time: {} ms", total_time_ms);
-    println!("Average kernel time: {:.3} µs / iter", avg_time_us);
+    println!("\nMorton codes (first 10):");
+    for i in 0..10.min(morton_codes.len()) {
+        println!("  Point {}: code = 0x{:016X}, index = {}", 
+                 i, morton_codes[i], indices[i]);
+    }
 
-    // データの検証（最後の実行結果を取得）
-    let output = stream.clone_dtoh(&output_dev)?;
-    println!("Output sample (first 5): {:?}", &output[0..5]);
+    println!("\nSorting on CPU...");
+    let mut pairs: Vec<(u64, i32)> = morton_codes.iter()
+        .zip(indices.iter())
+        .map(|(&c, &i)| (c, i))
+        .collect();
+    pairs.sort_unstable_by_key(|k| k.0);
+
+    let sorted_indices: Vec<i32> = pairs.iter().map(|k| k.1).collect();
+    let sorted_codes: Vec<u64> = pairs.iter().map(|k| k.0).collect();
+
+    println!("Sorted! First 10 codes:");
+    for i in 0..10 {
+        println!("  [{}] Code: 0x{:016X}, Original Index: {}", 
+                i, sorted_codes[i], sorted_indices[i]);
+    }
+
+    let sorted_indices_dev = stream.clone_htod(&sorted_indices)?;
+
+    let mut sorted_points_dev = stream.alloc_zeros::<Point3>(num_points)?;
+
+    let module2 = ctx.load_module(Ptx::from_file("src/kernel/sort.ptx"))?;
+    let sort_kernel = module2.load_function("sort_points")?;
+
+    let start_sort = Instant::now();
+    unsafe {
+        stream.launch_builder(&sort_kernel)
+            .arg(&points_dev)
+            .arg(&mut sorted_points_dev)
+            .arg(&sorted_indices_dev)
+            .arg(&(num_points as i32))
+            .launch(cfg)?;
+    }
+    stream.synchronize()?;
+    let duration_sort = start_sort.elapsed();
+    println!("Sort kernel execution time: {:.3} ms", duration_sort.as_secs_f64() * 1000.0);
+
+    let sorted_points = stream.clone_dtoh(&sorted_points_dev)?;
+    println!("First point: {:?}", sorted_points[0]);
+    println!("Second point: {:?}", sorted_points[1]);
+    println!("Third point: {:?}", sorted_points[2]);
 
     Ok(())
 }
