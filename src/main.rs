@@ -116,6 +116,7 @@ fn main() -> Result<()> {
     }
 
     let sorted_indices_dev = stream.clone_htod(&sorted_indices)?;
+    let sorted_codes_dev = stream.clone_htod(&sorted_codes)?;
 
     let mut sorted_points_dev = stream.alloc_zeros::<Point3>(num_points)?;
 
@@ -139,6 +140,45 @@ fn main() -> Result<()> {
     println!("First point: {:?}", sorted_points[0]);
     println!("Second point: {:?}", sorted_points[1]);
     println!("Third point: {:?}", sorted_points[2]);
+
+    println!("\nStarting simple search...");
+    let mut correspondence_indices_dev = stream.alloc_zeros::<i32>(num_points)?;
+    let mut correspondence_dists_dev = stream.alloc_zeros::<f32>(num_points)?;
+
+    let module3 = ctx.load_module(Ptx::from_file("src/kernel/find_points.ptx"))?;
+    let search_kernel = module3.load_function("find_correspondence_points")?;
+
+    let search_window_size = 32;
+    let num_query_points = num_points;
+
+    let start_search = Instant::now();
+    unsafe {
+        stream.launch_builder(&search_kernel)
+            .arg(&sorted_points_dev)  // Source
+            .arg(&sorted_points_dev)  // Target
+            .arg(&sorted_codes_dev)
+            .arg(&mut correspondence_indices_dev)
+            .arg(&mut correspondence_dists_dev)
+            .arg(&(num_query_points as i32))
+            .arg(&(num_points as i32))
+            .arg(&min_bound)
+            .arg(&scale)
+            .arg(&search_window_size)
+            .launch(cfg)?;
+    }
+    stream.synchronize()?;
+    let duration_search = start_search.elapsed();
+    println!("Search kernel execution time: {:.3} ms", duration_search.as_secs_f64() * 1000.0);
+
+    println!("Search completed.");
+
+    let results_idx = stream.clone_dtoh(&correspondence_indices_dev)?;
+    let results_dist = stream.clone_dtoh(&correspondence_dists_dev)?;
+
+    for i in 0..10 {
+        println!("Point {}: Found neighbor index {}, DistSq = {:.6}", 
+                i, results_idx[i], results_dist[i]);
+    }
 
     Ok(())
 }
