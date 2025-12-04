@@ -141,24 +141,36 @@ fn main() -> Result<()> {
     println!("Second point: {:?}", sorted_points[1]);
     println!("Third point: {:?}", sorted_points[2]);
 
+    let query_points_raw: Vec<Point3> = points_vec.iter().take(500).cloned().collect();
+
+    let num_query = query_points_raw.len();
+    println!("Number of query points: {}", num_query);
+
+    let query_points_dev = stream.clone_htod(&query_points_raw)?;
+
     println!("\nStarting simple search...");
-    let mut correspondence_indices_dev = stream.alloc_zeros::<i32>(num_points)?;
-    let mut correspondence_dists_dev = stream.alloc_zeros::<f32>(num_points)?;
+    // let mut correspondence_indices_dev = stream.alloc_zeros::<i32>(num_points)?;
+    // let mut correspondence_dists_dev = stream.alloc_zeros::<f32>(num_points)?;
+    let mut output_indices_dev = stream.alloc_zeros::<i32>(num_query)?;
+    let mut output_dists_dev = stream.alloc_zeros::<f32>(num_query)?;
 
     let module3 = ctx.load_module(Ptx::from_file("src/kernel/find_points.ptx"))?;
     let search_kernel = module3.load_function("find_correspondence_points")?;
 
     let search_window_size = 32;
-    let num_query_points = num_points;
+    let num_query_points = num_query;
 
     let start_search = Instant::now();
     unsafe {
         stream.launch_builder(&search_kernel)
-            .arg(&sorted_points_dev)  // Source
+            // .arg(&sorted_points_dev)  // Source
+            .arg(&query_points_dev)  // Source
             .arg(&sorted_points_dev)  // Target
             .arg(&sorted_codes_dev)
-            .arg(&mut correspondence_indices_dev)
-            .arg(&mut correspondence_dists_dev)
+            // .arg(&mut correspondence_indices_dev)
+            // .arg(&mut correspondence_dists_dev)
+            .arg(&mut output_indices_dev)
+            .arg(&mut output_dists_dev)
             .arg(&(num_query_points as i32))
             .arg(&(num_points as i32))
             .arg(&min_bound)
@@ -171,9 +183,12 @@ fn main() -> Result<()> {
     println!("Search kernel execution time: {:.3} ms", duration_search.as_secs_f64() * 1000.0);
 
     println!("Search completed.");
+    println!("Search for {} points completed.", num_query);
 
-    let results_idx = stream.clone_dtoh(&correspondence_indices_dev)?;
-    let results_dist = stream.clone_dtoh(&correspondence_dists_dev)?;
+    // let results_idx = stream.clone_dtoh(&correspondence_indices_dev)?;
+    // let results_dist = stream.clone_dtoh(&correspondence_dists_dev)?;
+    let results_idx = stream.clone_dtoh(&output_indices_dev)?;
+    let results_dist = stream.clone_dtoh(&output_dists_dev)?;
 
     for i in 0..10 {
         println!("Point {}: Found neighbor index {}, DistSq = {:.6}", 

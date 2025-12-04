@@ -66,7 +66,7 @@ extern "C" __global__ void find_correspondence_points(
     int num_ref, // number of target points
     float3 min_bound,
     float scale,
-    int search_windowsize // search window size
+    int search_window_size // search window size
 )
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -78,8 +78,8 @@ extern "C" __global__ void find_correspondence_points(
 
     int center_idx = binary_search(sorted_ref_codes, num_ref, q_code);
 
-    int start_idx = max(0, center_idx - search_windowsize);
-    int end_idx = min(num_ref, center_idx + search_windowsize);
+    int start_idx = max(0, center_idx - search_window_size);
+    int end_idx = min(num_ref, center_idx + search_window_size);
 
     float min_dist_sq = 1e20f;
     int best_idx = -1;
